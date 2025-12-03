@@ -3,12 +3,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
-#include <mpi.h> // Biblioteca MPI
+#include <mpi.h>
 
-// --- Estruturas para Cabeçalho BMP ---
 typedef struct
 {
-    uint16_t bfType; // Assinatura "BM"
+    uint16_t bfType;
     uint32_t bfSize; // Tamanho do arquivo
     uint16_t bfReserved1;
     uint16_t bfReserved2;
@@ -20,8 +19,8 @@ typedef struct
     uint32_t biSize;        // Tamanho do cabeçalho info
     int32_t biWidth;        // Largura
     int32_t biHeight;       // Altura
-    uint16_t biPlanes;      // Planos (deve ser 1)
-    uint16_t biBitCount;    // Bits por pixel (esperamos 24)
+    uint16_t biPlanes;      // Planos
+    uint16_t biBitCount;    // Bits por pixel
     uint32_t biCompression; // Compressão
     uint32_t biSizeImage;   // Tamanho da imagem comprimida
     int32_t biXPelsPerMeter;
@@ -30,17 +29,14 @@ typedef struct
     uint32_t biClrImportant;
 } BMPInfoHeader;
 
-// Estrutura simplificada para metadados
 typedef struct
 {
     int width;
     int height;
-} ImgDim;
+    unsigned char *data;
+} Image;
 
-// --- Funções Auxiliares (Apenas Rank 0 usa para IO) ---
-
-// Função auxiliar para leitura de BMP (apenas Mestre usa)
-unsigned char *readBMP(const char *filename, int *w, int *h, BMPHeader *outHead, BMPInfoHeader *outInfo)
+unsigned char *leBitMap(const char *filename, int *w, int *h, BMPHeader *outHead, BMPInfoHeader *outInfo)
 {
     FILE *f = fopen(filename, "rb");
     if (!f)
@@ -91,7 +87,7 @@ unsigned char *readBMP(const char *filename, int *w, int *h, BMPHeader *outHead,
     return data;
 }
 
-void writeBMP(const char *filename, int w, int h, unsigned char *data, BMPHeader head, BMPInfoHeader info)
+void escreveBitMap(const char *filename, int w, int h, unsigned char *data, BMPHeader head, BMPInfoHeader info)
 {
     FILE *f = fopen(filename, "wb");
     if (!f)
@@ -157,7 +153,7 @@ int main(int argc, char *argv[])
 
     int n_filter = atoi(argv[1]);
     if (n_filter % 2 == 0)
-        n_filter++; // Garante impar
+        n_filter++;
     int offset = n_filter / 2;
 
     int w, h;
@@ -176,24 +172,19 @@ int main(int argc, char *argv[])
         printf("MPI iniciado com %d processos. Filtro: %dx%d\n", world_size, n_filter, n_filter);
     }
 
-    // Medição de Tempo Inicia
     MPI_Barrier(MPI_COMM_WORLD);
     double start_time = MPI_Wtime();
 
-    // Broadcast das dimensões da imagem
     MPI_Bcast(&w, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&h, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // --- Definição da Partição de Dados ---
-    // Calculamos quantas linhas CADA processo vai processar (output)
     int rows_per_proc = h / world_size;
     int remainder = h % world_size;
 
-    // Arrays para Scatterv e Gatherv
     int *sendcounts = NULL;
     int *displs = NULL;
-    int *recvcounts_res = NULL; // Para o Gather final (sem overlap)
-    int *displs_res = NULL;     // Para o Gather final
+    int *recvcounts_res = NULL;
+    int *displs_res = NULL;
 
     if (world_rank == 0)
     {
@@ -205,19 +196,14 @@ int main(int argc, char *argv[])
         int current_row = 0;
         for (int i = 0; i < world_size; i++)
         {
-            // Quantas linhas 'úteis' este processo vai gerar?
             int rows = rows_per_proc + (i < remainder ? 1 : 0);
 
-            // Configurar GATHER (resultado final exato)
             recvcounts_res[i] = rows * w * 3;
             displs_res[i] = current_row * w * 3;
 
-            // Configurar SCATTER (input com overlap para mediana)
-            // Precisamos enviar linhas extras acima e abaixo
             int start_r = current_row - offset;
             int end_r = current_row + rows + offset;
 
-            // Clamp (não sair dos limites da imagem original)
             if (start_r < 0)
                 start_r = 0;
             if (end_r > h)
@@ -225,19 +211,14 @@ int main(int argc, char *argv[])
 
             int rows_to_send = end_r - start_r;
             sendcounts[i] = rows_to_send * w * 3;
-            displs[i] = start_r * w * 3; // Deslocamento em bytes
+            displs[i] = start_r * w * 3;
 
             current_row += rows;
         }
     }
 
-    // --- Passo 1: Distribuição (Scatterv) ---
-    // Calcular tamanho local
     int my_rows_output = rows_per_proc + (world_rank < remainder ? 1 : 0);
 
-    // Determinar quantas linhas de input vou receber (incluindo overlap)
-    // Precisamos de uma lógica local para saber o tamanho do buffer de recepção
-    // Calculamos inicio e fim teóricos globais para saber overlap
     int my_start_global_y = 0;
     for (int i = 0; i < world_rank; i++)
         my_start_global_y += (rows_per_proc + (i < remainder ? 1 : 0));
@@ -252,38 +233,29 @@ int main(int argc, char *argv[])
 
     unsigned char *local_input_buf = (unsigned char *)malloc(my_rows_input * w * 3);
 
-    // Envia os pedaços (incluindo overlap) do Mestre para todos
     MPI_Scatterv(full_img, sendcounts, displs, MPI_UNSIGNED_CHAR,
                  local_input_buf, my_rows_input * w * 3, MPI_UNSIGNED_CHAR,
                  0, MPI_COMM_WORLD);
 
-    // --- Passo 2: Filtro Mediana Local ---
-    // Resultado será armazenado num buffer que tem apenas as linhas de SAÍDA (sem overlap)
     unsigned char *local_output_buf = (unsigned char *)malloc(my_rows_output * w * 3);
 
-    // Arrays auxiliares para o sort
     int window_size = n_filter * n_filter;
     unsigned char *winR = (unsigned char *)malloc(window_size);
     unsigned char *winG = (unsigned char *)malloc(window_size);
     unsigned char *winB = (unsigned char *)malloc(window_size);
 
-    // Loop sobre as linhas de SAÍDA que este processo é responsável
     for (int y = 0; y < my_rows_output; y++)
     {
         int global_y = my_start_global_y + y;
 
-        // Qual a linha correspondente no buffer de entrada (que tem overlap)?
-        // O buffer de entrada começa em 'start_r_local' globalmente.
         int input_y_base = global_y - start_r_local;
 
         for (int x = 0; x < w; x++)
         {
             int out_idx = (y * w + x) * 3;
 
-            // Se for borda da imagem GLOBAL, copia original
             if (global_y < offset || global_y >= h - offset || x < offset || x >= w - offset)
             {
-                // Mapear para buffer de input
                 int in_idx = (input_y_base * w + x) * 3;
                 local_output_buf[out_idx] = local_input_buf[in_idx];
                 local_output_buf[out_idx + 1] = local_input_buf[in_idx + 1];
@@ -291,13 +263,11 @@ int main(int argc, char *argv[])
                 continue;
             }
 
-            // Coletar vizinhos
             int count = 0;
             for (int ky = -offset; ky <= offset; ky++)
             {
                 for (int kx = -offset; kx <= offset; kx++)
                 {
-                    // Acessar buffer de entrada relativo
                     int ny = input_y_base + ky;
                     int nx = x + kx;
 
@@ -309,7 +279,6 @@ int main(int argc, char *argv[])
                 }
             }
 
-            // Ordenar e pegar mediana
             qsort(winB, window_size, sizeof(unsigned char), compare);
             qsort(winG, window_size, sizeof(unsigned char), compare);
             qsort(winR, window_size, sizeof(unsigned char), compare);
@@ -323,10 +292,8 @@ int main(int argc, char *argv[])
     free(winR);
     free(winG);
     free(winB);
-    free(local_input_buf); // Não precisamos mais do input com overlap
+    free(local_input_buf);
 
-    // --- Passo 3: Conversão para Tons de Cinza Local ---
-    // Opera in-place no local_output_buf
     for (int i = 0; i < my_rows_output * w; i++)
     {
         int idx = i * 3;
@@ -341,7 +308,6 @@ int main(int argc, char *argv[])
         local_output_buf[idx + 2] = gray;
     }
 
-    // --- Passo 4: Histograma Distribuído ---
     long local_hist[256] = {0};
     for (int i = 0; i < my_rows_output * w; i++)
     {
@@ -349,11 +315,8 @@ int main(int argc, char *argv[])
     }
 
     long global_hist[256] = {0};
-    // Soma os histogramas de todos os processos
     MPI_Allreduce(local_hist, global_hist, 256, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
 
-    // --- Passo 5: Equalização Local ---
-    // (Cálculo do Mapa é duplicado em todos os nós, mas é muito rápido)
     long cdf[256] = {0};
     cdf[0] = global_hist[0];
     for (int i = 1; i < 256; i++)
@@ -383,7 +346,6 @@ int main(int argc, char *argv[])
         map[i] = (unsigned char)val;
     }
 
-    // Aplicar mapa na fatia local
     for (int i = 0; i < my_rows_output * w; i++)
     {
         int idx = i * 3;
@@ -394,8 +356,6 @@ int main(int argc, char *argv[])
         local_output_buf[idx + 2] = newVal;
     }
 
-    // --- Passo 6: Coleta (Gatherv) ---
-    // Recolhe as fatias processadas de volta para o full_img no Rank 0
     MPI_Gatherv(local_output_buf, my_rows_output * w * 3, MPI_UNSIGNED_CHAR,
                 full_img, recvcounts_res, displs_res, MPI_UNSIGNED_CHAR,
                 0, MPI_COMM_WORLD);

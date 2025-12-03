@@ -5,8 +5,6 @@
 #include <math.h>
 #include <omp.h>
 
-#define N_FILTER 3
-
 typedef struct
 {
     uint16_t bfType;
@@ -175,22 +173,21 @@ int compare(const void *a, const void *b)
     return (*(unsigned char *)a - *(unsigned char *)b);
 }
 
-void filtroMediana(Image *img)
+void filtroMediana(Image *img, int n_filter)
 {
     int w = img->width;
     int h = img->height;
     unsigned char *newData = (unsigned char *)malloc(w * h * 3);
 
-    int offset = N_FILTER / 2;
-
-    const int windowSize = N_FILTER * N_FILTER;
+    int offset = n_filter / 2;
+    const int windowSize = n_filter * n_filter;
 
 #pragma omp parallel for
     for (int y = 0; y < h; y++)
     {
-        unsigned char windowR[9];
-        unsigned char windowG[9];
-        unsigned char windowB[9];
+        unsigned char windowR[windowSize];
+        unsigned char windowG[windowSize];
+        unsigned char windowB[windowSize];
 
         for (int x = 0; x < w; x++)
         {
@@ -229,7 +226,7 @@ void filtroMediana(Image *img)
 
     free(img->data);
     img->data = newData;
-    printf("1. Filtro Mediana %dx%d aplicado (Paralelo).\n", N_FILTER, N_FILTER);
+    printf("1. Filtro Mediana %dx%d aplicado (Paralelo).\n", n_filter, n_filter);
 }
 
 void grayscale(Image *img)
@@ -326,8 +323,22 @@ void equalizacao(Image *img)
     }
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc < 3)
+    {
+        printf("Uso: %s <tamanho_filtro_N> <num_threads>\n", argv[0]);
+        return 1;
+    }
+
+    int n_filter = atoi(argv[1]);
+    if (n_filter % 2 == 0)
+        n_filter++; // Garante ímpar
+
+    int num_threads = atoi(argv[2]);
+
+    omp_set_num_threads(num_threads);
+
     char inputFilename[] = "../bitmaps/small.bmp";
     char outputFilename[] = "output_paralelo.bmp";
 
@@ -342,7 +353,7 @@ int main()
 
     double start_time = omp_get_wtime();
 
-    filtroMediana(img);
+    filtroMediana(img, n_filter);
     grayscale(img);
     equalizacao(img);
 
